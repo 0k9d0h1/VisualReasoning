@@ -39,7 +39,7 @@ from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
+from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel, Qwen2_5_VLForConditionalGeneration
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
@@ -204,13 +204,22 @@ class FSDPSFTTrainer:
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings, mesh=self.device_mesh)
 
         with init_context():
-            self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-                local_model_path,
-                config=config,
-                torch_dtype=torch.float32,
-                attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
-            )
+            if self.processor is not None:
+                self.model: PreTrainedModel = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    local_model_path,
+                    config=config,
+                    trust_remote_code=trust_remote_code,
+                    torch_dtype=torch.float32,
+                    attn_implementation="flash_attention_2",
+                )
+            else:
+                self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+                    local_model_path,
+                    config=config,
+                    torch_dtype=torch.float32,
+                    attn_implementation="flash_attention_2",
+                    trust_remote_code=trust_remote_code,
+                )
 
             if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch

@@ -86,6 +86,14 @@ class MultiTurnSFTDataset(Dataset):
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
+            # Preprocess parquet file
+            messages = messages.tolist()
+            for message in messages:
+                message["content"] = message["content"].tolist()
+                for content in message["content"]:
+                    for key in list(content.keys()):
+                        if content[key] is None:
+                            del content[key]
 
             text = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             image_inputs, video_inputs = process_vision_info(messages)
