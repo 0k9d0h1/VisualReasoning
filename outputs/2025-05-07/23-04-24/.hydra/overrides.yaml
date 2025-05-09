@@ -1,0 +1,16 @@
+- data.train_files=./data/visual7w_train.parquet
+- data.val_files=./data/visual7w_val.parquet
+- data.multiturn.enable=true
+- data.multiturn.messages_key=messages
+- data.micro_batch_size=6
+- data.train_batch_size=18
+- data.micro_batch_size_per_gpu=1
+- data.max_length=8192
+- model.partial_pretrain=Qwen/Qwen2.5-VL-3B-Instruct
+- trainer.default_local_dir=/home/kdh0901/Desktop/cache_dir/kdh0901/checkpoints
+- trainer.project_name=test
+- trainer.experiment_name=test-sft-qwen-2.5-vl-3b-instruct-sp2
+- trainer.logger=[console,wandb]
+- trainer.total_training_steps=1
+- trainer.default_hdfs_dir=null
+- ulysses_sequence_parallel_size=1

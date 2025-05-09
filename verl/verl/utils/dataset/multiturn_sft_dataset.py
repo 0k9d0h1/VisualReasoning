@@ -19,6 +19,8 @@ from typing import List, Union
 
 import pandas as pd
 import torch
+import numpy as np
+from collections import defaultdict
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer
 
@@ -26,6 +28,33 @@ from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_local_path_from_hdfs
 from qwen_vl_utils import process_vision_info
 
+class MultiModalCollator(object):
+    def __init__(self, processor=None):
+        self.processor = processor
+
+    def __call__(self, data_list: list[dict]) -> dict:
+        tensors = defaultdict(list)
+        non_tensors = defaultdict(list)
+
+        for data in data_list:
+            for key, val in data.items():
+                if isinstance(val, torch.Tensor):
+                    tensors[key].append(val)
+                elif key == "raw_text":
+                    non_tensors[key].append(val)
+                elif key == "image_inputs":
+                    non_tensors[key].extend(val)
+        for key, val in tensors.items():
+            tensors[key] = torch.stack(val, dim=0)
+        
+        inputs = self.processor(
+            text=non_tensors["raw_text"],
+            images=non_tensors["image_inputs"],
+            padding=True,
+            return_tensors="pt",
+        )
+
+        return {**tensors, "pixel_values": inputs.pixel_values, "image_grid_thw": inputs.image_grid_thw}
 
 class MultiTurnSFTDataset(Dataset):
     """
@@ -81,11 +110,12 @@ class MultiTurnSFTDataset(Dataset):
         return len(self.messages)
 
     def __getitem__(self, item):
-        tokenizer = self.tokenizer
         messages = self.messages[item]
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
+            tokenizer = self.processor.tokenizer
+
             # Preprocess parquet file
             messages = messages.tolist()
             for message in messages:
@@ -95,21 +125,9 @@ class MultiTurnSFTDataset(Dataset):
                         if content[key] is None:
                             del content[key]
 
-            text = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            text = self.processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+            input_ids = self.processor.apply_chat_template(messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)[0]
             image_inputs, video_inputs = process_vision_info(messages)
-            inputs = self.processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            )
-
-            pixel_values = inputs.pixel_values
-            image_grid_thw = inputs.image_grid_thw
-
-            full_tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)
-            input_ids = full_tokens[0]  # The output is already a tensor
             attention_mask = torch.ones_like(input_ids)
 
             # Create loss mask by identifying assistant responses
@@ -118,10 +136,10 @@ class MultiTurnSFTDataset(Dataset):
             for i, msg in enumerate(messages):
                 # Get tokens for messages up to this point to find the start position
                 prefix_messages = messages[: i + 1]
-                prefix_tokens = tokenizer.apply_chat_template(prefix_messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)
+                prefix_tokens = self.processor.apply_chat_template(prefix_messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)
 
                 # Get tokens for messages up to previous point
-                prev_tokens = tokenizer.apply_chat_template(messages[:i], tokenize=True, return_tensors="pt", add_generation_prompt=False) if i > 0 else None
+                prev_tokens = self.processor.apply_chat_template(messages[:i], tokenize=True, return_tensors="pt", add_generation_prompt=False) if i > 0 else None
 
                 # Calculate start and end positions
                 start_pos = prev_tokens[0].shape[0] if prev_tokens is not None else 0
@@ -163,15 +181,16 @@ class MultiTurnSFTDataset(Dataset):
             position_ids = position_ids * attention_mask
 
             return {
+                "raw_text": text,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
-                "pixel_values": pixel_values,
-                "image_grid_thw": image_grid_thw,
+                "image_inputs": image_inputs,
                 "loss_mask": loss_mask,
             }
 
         else:
+            tokenizer = self.tokenizer
             # First, get the full conversation tokens
             full_tokens = tokenizer.apply_chat_template(messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)
             input_ids = full_tokens[0]  # The output is already a tensor

@@ -16,7 +16,7 @@ dependencies:
   - libuuid=1.41.5=h5eee18b_0
   - ncurses=6.4=h6a678d5_0
   - openssl=1.1.1w=h7f8727e_0
-  - pip=25.1=pyhc872135_0
+  - pip
   - python=3.10.0=h12debd9_5
   - readline=8.2=h5eee18b_0
   - setuptools=78.1.1=py310h06a4308_0

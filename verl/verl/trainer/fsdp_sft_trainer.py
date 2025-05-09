@@ -43,7 +43,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel, Qwen
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.dataset import SFTDataset
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset, MultiModalCollator
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.distributed import initialize_global_process_group
 from verl.utils.fs import copy_to_local
@@ -160,25 +160,51 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(f"Using FSDP rank {rank} and size {world_size} for data distribution")
 
-        self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
-        self.train_dataloader = DataLoader(
-            dataset=self.train_dataset,
-            batch_size=config.data.train_batch_size,
-            sampler=self.train_sampler,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-        )
+        if self.processor is not None:
+            collate_fn = MultiModalCollator(
+                processor=self.processor
+            )
+            self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
+            self.train_dataloader = DataLoader(
+                dataset=self.train_dataset,
+                batch_size=config.data.train_batch_size,
+                sampler=self.train_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=collate_fn,
+            )
 
-        self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
-        self.val_dataloader = DataLoader(
-            dataset=self.val_dataset,
-            batch_size=config.data.micro_batch_size_per_gpu,
-            sampler=self.val_sampler,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-        )
+            self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
+            self.val_dataloader = DataLoader(
+                dataset=self.val_dataset,
+                batch_size=config.data.micro_batch_size_per_gpu,
+                sampler=self.val_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=collate_fn,
+            )
+        else:
+            self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True)
+            self.train_dataloader = DataLoader(
+                dataset=self.train_dataset,
+                batch_size=config.data.train_batch_size,
+                sampler=self.train_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+            )
+
+            self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank, drop_last=True)
+            self.val_dataloader = DataLoader(
+                dataset=self.val_dataset,
+                batch_size=config.data.micro_batch_size_per_gpu,
+                sampler=self.val_sampler,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+            )
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -249,7 +275,7 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
-        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+        mixed_precision = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
@@ -323,7 +349,9 @@ class FSDPSFTTrainer:
                 if not use_sp:
                     # Standard forward pass without sequence parallel
                     labels = input_ids[:, 1:].contiguous()
-                    output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, pixel_values=pixel_values, image_trid_thw=image_grid_thw, use_cache=False)
+                    print("input loaded")
+                    output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw, use_cache=False)
+                    print("output computed")
                     logits = output.logits
 
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -422,11 +450,16 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
 
-        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        if self.processor is not None:
+            micro_batches = batch.multimodal_split(self.config.data.micro_batch_size_per_gpu, image_pad_token_id=151655, spatial_merge_size=4)
+        else:
+            micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
         for micro_batch in micro_batches:
+            print("Entering to compute loss")
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
+            print("Micro batch processed")
             step_loss += loss.item()
 
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
