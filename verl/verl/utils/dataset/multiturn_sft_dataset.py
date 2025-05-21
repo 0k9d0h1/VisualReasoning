@@ -126,6 +126,7 @@ class MultiTurnSFTDataset(Dataset):
                             del content[key]
 
             text = self.processor.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+            print(text)
             input_ids = self.processor.apply_chat_template(messages, tokenize=True, return_tensors="pt", add_generation_prompt=False)[0]
             image_inputs, video_inputs = process_vision_info(messages)
             attention_mask = torch.ones_like(input_ids)
@@ -184,7 +185,7 @@ class MultiTurnSFTDataset(Dataset):
                 "raw_text": text,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
-                "position_ids": position_ids,
+                # "position_ids": position_ids,
                 "image_inputs": image_inputs,
                 "loss_mask": loss_mask,
             }

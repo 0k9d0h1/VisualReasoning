@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
+from qwen_vl_utils import process_vision_info
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,17 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-        messages = self._build_messages(row_dict)
+        if self.need_tools_kwargs and self.processor is not None:
+            messages = row_dict.pop(self.prompt_key)
+            # Preprocess parquet file
+            for message in messages:
+                message["content"] = message["content"]
+                for content in message["content"]:
+                    for key in list(content.keys()):
+                        if content[key] is None:
+                            del content[key]
+        else:
+            messages = self._build_messages(row_dict)
         model_inputs = {}
 
         if self.processor is not None:
@@ -166,16 +177,19 @@ class RLHFDataset(Dataset):
 
             raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             multi_modal_data = {}
+            
+            if self.need_tools_kwargs:
+                images, videos = process_vision_info(messages)
+            else:
+                images = None
+                if self.image_key in row_dict:
+                    images = [process_image(image) for image in row_dict.pop(self.image_key)]
+                    multi_modal_data["image"] = images
 
-            images = None
-            if self.image_key in row_dict:
-                images = [process_image(image) for image in row_dict.pop(self.image_key)]
-                multi_modal_data["image"] = images
-
-            videos = None
-            if self.video_key in row_dict:
-                videos = [process_video(video) for video in row_dict.pop(self.video_key)]
-                multi_modal_data["video"] = [video.numpy() for video in videos]
+                videos = None
+                if self.video_key in row_dict:
+                    videos = [process_video(video) for video in row_dict.pop(self.video_key)]
+                    multi_modal_data["video"] = [video.numpy() for video in videos]
 
             model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt")
 

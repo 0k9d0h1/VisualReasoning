@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import json
+import shutil
 from contextlib import contextmanager
 from copy import deepcopy
 from json import JSONDecodeError
@@ -49,11 +51,14 @@ from verl.utils.torch_functional import get_response_mask, pad_sequence_to_lengt
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
+    MultimodalAsyncRolloutRequest,
     AsyncRolloutRequestStateEnum,
     FinishReasonTypeEnum,
     Message,
 )
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _post_process_outputs, _pre_process_inputs
+from qwen_vl_utils import process_vision_info
+from PIL import Image
 
 if TYPE_CHECKING:
     from torch import nn
@@ -434,7 +439,7 @@ class AsyncSGLangRollout(BaseRollout):
                     parsed_tool_calls = _req.messages[-1].tool_calls
                     tool_call_results = await asyncio.gather(
                         *[
-                            self._tool_map[tool_call.function.name].execute(
+                            _req.executor_tool.execute(
                                 _req.request_id,
                                 tool_call.function.arguments,
                                 **_req.tools_kwargs[tool_call.function.name].get("execute_kwargs", {}),
@@ -728,3 +733,438 @@ class AsyncSGLangRollout(BaseRollout):
                 req_list.append(req)
 
         return req_list
+
+
+class MultimodalAsyncSGLangRollout(AsyncSGLangRollout):
+    def __init__(
+        self,
+        actor_module: nn.Module | str,
+        config: DictConfig,
+        tokenizer,
+        processor,
+        model_hf_config,
+        port=None,
+        **kwargs,
+    ):
+        super().__init__(actor_module, config, tokenizer, model_hf_config, port=port, **kwargs)
+        self.processor = processor
+        self.executor_tools = {}
+
+    def _apply_tool_chat_template(self, prompt_with_chat_template, _tool_schemas,):
+        tool_chat_template = f"""\n\n# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>"""
+        for tool in _tool_schemas:
+            tool_dict = {
+                "type": tool.type,
+                "function": tool.function.model_dump(),   # <-- Pydantic v2
+            }
+            del tool_dict["function"]["strict"]
+            for prop in tool_dict["function"]["parameters"]["properties"]:
+                if not tool_dict["function"]["parameters"]["properties"][prop]["enum"]:
+                    del tool_dict["function"]["parameters"]["properties"][prop]["enum"]
+            tool_json = json.dumps(tool_dict, ensure_ascii=False)
+            
+            tool_chat_template += f"""
+{tool_json}"""
+        tool_chat_template += """
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>"""
+
+        # Find the index of the system message end marker
+        marker = "<|im_start|>system"
+        end_marker = "<|im_end|>"
+        idx = prompt_with_chat_template.find(marker)
+        if idx == -1:
+            # marker not found, just append tool_chat_template at the beginning
+            return tool_chat_template + prompt_with_chat_template
+        # Find the end of the system message
+        end_idx = prompt_with_chat_template.find(end_marker, idx)
+        if end_idx == -1:
+            # end marker not found, append tool_chat_template after marker
+            insert_pos = idx
+        else:
+            insert_pos = end_idx
+        # Insert tool_chat_template after the system message
+        return (
+            prompt_with_chat_template[:insert_pos]
+            + tool_chat_template
+            + prompt_with_chat_template[insert_pos:]
+        )
+    
+    async def _async_rollout_a_request(self, req: MultimodalAsyncRolloutRequest, do_sample: bool = True, is_validate: bool = False, **kwargs) -> MultimodalAsyncRolloutRequest:
+        assert self._tp_rank == 0, "only the master process can call this function"
+        _req = deepcopy(req)
+        finish_reason_type = None
+        output = None
+
+        current_turns = 0
+        while current_turns < self.config.multi_turn.max_turns:
+            if _req.state == AsyncRolloutRequestStateEnum.PENDING:
+                if _req.tools is not None:
+                    tool_creation_coroutines = []
+                    for tool_schema in _req.tools:
+                        tool = self._tool_map[tool_schema.function.name]
+                        create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                        tool_creation_coroutines.append(self.executor_tools[_req.request_id].create(_req.request_id, **create_kwargs))
+                    await asyncio.gather(*tool_creation_coroutines)
+                _req.state = AsyncRolloutRequestStateEnum.RUNNING
+            elif _req.state == AsyncRolloutRequestStateEnum.TOOL_CALLING:
+                if _req.tool_calls[-1] is not None:
+                    parsed_tool_calls = _req.tool_calls[-1]
+                    tool_call_results = await asyncio.gather(
+                        *[
+                            self.executor_tools[_req.request_id].execute(
+                                _req.request_id,
+                                tool_call.function.arguments,
+                                **_req.tools_kwargs[tool_call.function.name].get("execute_kwargs", {}),
+                            )
+                            for tool_call in parsed_tool_calls
+                        ]
+                    )
+                    print(f"tool_call_results: {tool_call_results}")
+                    print("-" * 200)
+                    for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results):
+                        _req.add_tool_response_message(self.processor, resp, format=self.config.multi_turn.format)
+                        if len(_req.input_ids) >= self.config.max_model_len:
+                            break
+                    if len(_req.input_ids) >= self.config.max_model_len:
+                        finish_reason_type = FinishReasonTypeEnum.STOP
+                        break
+                    _req.state = AsyncRolloutRequestStateEnum.RUNNING
+                else:
+                    raise ValueError(f"Unexpected tool calling last message state: {_req.messages[-1]}")
+            elif _req.state == AsyncRolloutRequestStateEnum.RUNNING:
+                generation_prompt = _req.get_generation_prompt(self.processor)
+                image_inputs = _req.get_multimodal_inputs()
+                if not do_sample:
+                    kwargs = dict(
+                        n=1,
+                        presence_penalty=0.0,
+                        frequency_penalty=0.0,
+                        repetition_penalty=1.0,
+                        temperature=0,
+                        top_p=1,
+                        top_k=-1,
+                        ignore_eos=False,
+                        min_new_tokens=0,
+                        max_new_tokens=self.config.response_length,
+                        skip_special_tokens=True,
+                        spaces_between_special_tokens=True,
+                    )
+                elif is_validate:
+                    # TODO: try **
+                    kwargs = {
+                        "top_k": self.config.val_kwargs.top_k,
+                        "top_p": self.config.val_kwargs.top_p,
+                        "temperature": self.config.val_kwargs.temperature,
+                        "n": 1,  # if validate, already repeat in ray_trainer
+                    }
+                if "n" not in kwargs or kwargs["n"] > 1:  # group size is supported in preprocess
+                    kwargs["n"] = 1
+                # users can customize different sampling_params at different run
+                with self.update_sampling_params(**kwargs):
+                    output = await self._engine.async_generate(
+                        prompt=generation_prompt,
+                        image_data=image_inputs,
+                        sampling_params=self.sampling_params,
+                        return_logprob=False,
+                    )
+                content = output["text"]
+
+                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
+                current_turns += 1
+                if finish_reason_type == FinishReasonTypeEnum.LENGTH:
+                    _req.add_assistant_message(self.tokenizer, content, already_over_long=True, format=self.config.multi_turn.format)
+                    break
+                else:
+                    if self._function_call_parser and self._function_call_parser.has_tool_call(content):
+                        finish_reason_type = FinishReasonTypeEnum.TOOL_CALL
+                        _req.state = AsyncRolloutRequestStateEnum.TOOL_CALLING
+                        try:
+                            normed_content, tool_calls = self._function_call_parser.parse_non_stream(content)
+                        except JSONDecodeError:
+                            normed_content = content
+                            tool_calls = []
+                        except AttributeError:
+                            normed_content = content
+                            tool_calls = []
+                        parsed_tool_calls = [
+                            OpenAIFunctionToolCall(
+                                id=str(tool_call.tool_index),
+                                function=OpenAIFunctionParsedSchema(name=tool_call.name, arguments=tool_call.parameters),
+                            )
+                            for tool_call in tool_calls
+                        ]
+                        if len(parsed_tool_calls) > 0:
+                            _req.add_assistant_message(
+                                self.tokenizer,
+                                content,
+                                tool_calls=parsed_tool_calls,
+                                format=self.config.multi_turn.format,
+                            )
+
+                            # print("message after adding", _req.messages)
+                        else:
+                            _req.add_assistant_message(self.tokenizer, content, format=self.config.multi_turn.format)
+                            finish_reason_type = FinishReasonTypeEnum.STOP
+                            _req.state = AsyncRolloutRequestStateEnum.COMPLETED
+                            break
+                    else:
+                        _req.add_assistant_message(self.tokenizer, content, format=self.config.multi_turn.format)
+                        break
+
+        if current_turns >= self.config.multi_turn.max_turns:
+            finish_reason_type = FinishReasonTypeEnum.STOP
+
+        # Calculate the reward for each tool
+        async def calc_reward_and_release_fn(name: str, tool: BaseTool):
+            reward = await tool.calc_reward(_req.request_id, **_req.tools_kwargs[name].get("calc_reward_kwargs", {}))
+            await tool.release(_req.request_id, **_req.tools_kwargs[name].get("release_kwargs", {}))
+            return name, reward
+
+        tool_reward_tasks = []
+        for name in _req.tools_kwargs.keys():
+            tool = self._tool_map[name]
+            tool_reward_tasks.append(calc_reward_and_release_fn(name, tool))
+        tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
+        tool_reward_scores = dict(tool_reward_scores)
+        _req.finalize(self.tokenizer, tool_reward_scores, finish_reason_type)
+
+        return _req
+    
+    async def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[MultimodalAsyncRolloutRequest]:
+        assert "raw_prompt" in prompts.non_tensor_batch, "need data.return_raw_chat=True, due to no official way do parse_messages"
+
+        def python_codes_for_images_reading(image_paths):
+            code = ""
+            
+            for idx, path in enumerate(image_paths):
+                code += f"""image_{idx+1} = Image.open("{path}").convert("RGB")\n"""
+            return code
+
+        req_list = []
+        for data_idx, raw_prompt in enumerate(prompts.non_tensor_batch["raw_prompt"]):
+            for rollout_offset in range(n):
+                request_id = str(uuid4())
+                if self._tool_schemas:
+                    _tools_kwargs = prompts.non_tensor_batch["tools_kwargs"][data_idx]
+                    _tool_schemas = []
+                    for k in _tools_kwargs.keys():
+                        _tool_schemas.append(self._tool_map[k].get_openai_tool_schema())
+                    prompt_with_chat_template = self.processor.apply_chat_template(raw_prompt.tolist(), add_generation_prompt=True, tokenize=False)
+                    image, video = process_vision_info(raw_prompt.tolist())
+                    # prompt_with_chat_template = self._apply_tool_chat_template(prompt_with_chat_template, _tool_schemas)
+                    
+                    template_tool = self._tool_map["code_executor"]
+                    tool_cls = type(template_tool)
+
+                    new_tool = tool_cls(config=template_tool.config,
+                                        tool_schema=template_tool.tool_schema)
+                    save_dir = f"./temp_images/{request_id}"
+                    os.makedirs(save_dir, exist_ok=True)
+                    image_paths = []
+                    for i, img in enumerate(image):
+                        path = os.path.join(save_dir, f"image_{i}.png")
+                        img.save(path)
+                        image_paths.append(path)
+                    init_code = python_codes_for_images_reading(image_paths)
+
+                    await new_tool.create(
+                        "init",
+                        None
+                    )
+                    await new_tool.execute(
+                            "init",
+                            json.dumps({"code": init_code})
+                    )
+
+                    self.executor_tools[request_id] = new_tool
+
+                    if os.path.exists(save_dir):
+                        shutil.rmtree(save_dir)
+                    
+                    inputs = self.processor(
+                        text=[prompt_with_chat_template],
+                        images=image,
+                        videos=video,
+                        padding=True,
+                        return_tensors="pt",
+                    )
+
+                    _input_ids = inputs["input_ids"][0]
+                    _attention_mask = inputs["attention_mask"][0]
+
+                    _input_ids = _input_ids.tolist()
+                    _attention_mask = _attention_mask.tolist()
+                    _image_grid_thw = inputs.get("image_grid_thw")
+                    _pixel_values = inputs.get("pixel_values")
+
+                    if len(_input_ids) > self.config.prompt_length:
+                        logger.warning(
+                            "Prompt {} has length {} greater than max_prompt_len {}",
+                            data_idx,
+                            len(_input_ids),
+                            self.config.prompt_length,
+                        )
+                        _input_ids = _input_ids[: self.config.prompt_length]
+                        _attention_mask = _attention_mask[: self.config.prompt_length]
+                        _position_ids = _position_ids[: self.config.prompt_length]
+                else:
+                    _input_ids = _pre_process_inputs(self.pad_token_id, prompts.batch["input_ids"][data_idx])
+                    _attention_mask = _pre_process_inputs(0, prompts.batch["attention_mask"][data_idx])
+                    _position_ids = compute_position_id_with_mask(torch.tensor(_attention_mask)).tolist()
+                    _tool_schemas = []
+                    _tools_kwargs = {}
+
+                req = MultimodalAsyncRolloutRequest(
+                    batch_data_id=data_idx,
+                    rollout_offset=rollout_offset,
+                    request_id=request_id,
+                    state=AsyncRolloutRequestStateEnum.PENDING,
+                    messages=raw_prompt.tolist(),
+                    tools=_tool_schemas,
+                    tools_kwargs=_tools_kwargs,
+                    input_ids=_input_ids,
+                    prompt_ids=_input_ids,
+                    response_ids=[],
+                    image_grid_thw=_image_grid_thw,
+                    pixel_values=_pixel_values,
+                    attention_mask=_attention_mask,
+                    prompt_attention_mask=_attention_mask,
+                    response_attention_mask=[],
+                    loss_mask=[0] * len(_input_ids),
+                    prompt_loss_mask=[0] * len(_input_ids),
+                    response_loss_mask=[],
+                    reward_scores={},
+                    max_response_len=self.config.response_length,
+                    max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
+                )
+
+                error_message = f"Request {req.request_id} has mismatched lengths: input_ids={len(req.input_ids)}, attention_mask={len(req.attention_mask)}, loss_mask={len(req.loss_mask)}"
+                assert len(req.input_ids) == len(req.attention_mask) == len(req.loss_mask), error_message
+
+                req_list.append(req)
+
+        return req_list
+    
+    @torch.no_grad()
+    def generate_sequences_with_tools(self, prompts: DataProto, **kwargs) -> DataProto:
+        # Async rollout with tools support
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        tgt_device = prompts.batch["input_ids"].device
+        if self._tp_rank == 0:
+            loop = asyncio.get_event_loop()
+            req_list = loop.run_until_complete(
+                self._preprocess_prompt_to_async_rollout_requests(
+                    prompts,
+                    n=1 if is_validate else self.config.n,
+                )
+            )
+            output_req_list = loop.run_until_complete(
+                asyncio.gather(
+                    *[self._async_rollout_a_request(req, do_sample, is_validate, **kwargs) for req in req_list],
+                )
+            )
+            sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
+        else:
+            sorted_output_req_list = None
+
+        [sorted_output_req_list] = broadcast_pyobj(
+            data=[sorted_output_req_list],
+            rank=self._tp_rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            force_cpu_device=False,
+        )
+        # Construct the batch data
+        prompt_ids, response_ids = [], []
+        prompt_attention_mask, response_attention_mask = [], []
+        prompt_position_ids, response_position_ids = [], []
+        prompt_loss_mask, response_loss_mask = [], []
+        messages = []
+        reward_scores = []
+        for req in sorted_output_req_list:
+            assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
+            assert len(req.input_ids) == len(req.attention_mask) == len(req.loss_mask), f"""Request {req.request_id} has different length of 
+                {len(req.input_ids)=}, {len(req.attention_mask)=}, {len(req.loss_mask)=}"""
+            error_message_lines = [
+                f"""Request {req.request_id} has input_ids length {len(req.input_ids)}
+                    greater than max_model_len {self.config.max_model_len}""",
+                f"Decoded input_ids: {self.tokenizer.decode(req.input_ids)}",
+                f"Decoded prompt_ids: {self.tokenizer.decode(req.prompt_ids)}",
+                f"Decoded response_ids: {self.tokenizer.decode(req.response_ids)}",
+                f"Messages: {req.messages}",
+                f"Max model length: {req.max_model_len}",
+            ]
+            error_message = "\n".join(error_message_lines)
+            assert len(req.input_ids) <= self.config.max_model_len, error_message
+
+            prompt_ids.append(torch.tensor(req.prompt_ids, dtype=torch.int, device=tgt_device))
+            response_ids.append(torch.tensor(req.response_ids, dtype=torch.int, device=tgt_device))
+            if len(req.response_ids) > self.config.response_length:
+                print(
+                    f"""{req.request_id=} has response_ids length {len(req.response_ids)} 
+                    greater than max_response_len {self.config.response_length},\n{req=}"""
+                )
+            prompt_attention_mask.append(torch.tensor(req.prompt_attention_mask, dtype=torch.int, device=tgt_device))
+            response_attention_mask.append(torch.tensor(req.response_attention_mask, dtype=torch.int, device=tgt_device))
+            prompt_position_ids.append(torch.tensor(req.prompt_position_ids, dtype=torch.int, device=tgt_device))
+            response_position_ids.append(torch.tensor(req.response_position_ids, dtype=torch.int, device=tgt_device))
+            prompt_loss_mask.append(torch.tensor(req.prompt_loss_mask, dtype=torch.int, device=tgt_device))
+            response_loss_mask.append(torch.tensor(req.response_loss_mask, dtype=torch.int, device=tgt_device))
+            messages.append({"messages": req.messages})
+            reward_scores.append(req.reward_scores)
+
+        prompt_ids = pad_sequence(prompt_ids, batch_first=True, padding_value=self.pad_token_id, padding_side="left")
+        if prompt_ids.shape[1] < self.config.prompt_length:
+            prompt_ids = pad_sequence_to_length(prompt_ids, self.config.prompt_length, self.pad_token_id, left_pad=True)
+        response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
+        if response_ids.shape[1] < self.config.response_length:
+            response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
+        prompt_attention_mask = pad_sequence(prompt_attention_mask, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_attention_mask.shape[1] < self.config.prompt_length:
+            prompt_attention_mask = pad_sequence_to_length(prompt_attention_mask, self.config.prompt_length, 0, left_pad=True)
+        response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
+        if response_attention_mask.shape[1] < self.config.response_length:
+            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
+        prompt_position_ids = pad_sequence(prompt_position_ids, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_position_ids.shape[1] < self.config.prompt_length:
+            prompt_position_ids = pad_sequence_to_length(prompt_position_ids, self.config.prompt_length, 0, left_pad=True)
+        response_position_ids = pad_sequence(response_position_ids, batch_first=True, padding_value=0)
+        if response_position_ids.shape[1] < self.config.response_length:
+            response_position_ids = pad_sequence_to_length(response_position_ids, self.config.response_length, 0)
+        prompt_loss_mask = pad_sequence(prompt_loss_mask, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_loss_mask.shape[1] < self.config.prompt_length:
+            prompt_loss_mask = pad_sequence_to_length(prompt_loss_mask, self.config.prompt_length, 0, left_pad=True)
+        response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
+        if response_loss_mask.shape[1] < self.config.response_length:
+            response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
+
+        input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+        position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)
+        loss_mask = torch.cat((prompt_loss_mask, response_loss_mask), dim=-1)
+
+        # Construct the batch data
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "input_ids": input_ids,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": loss_mask,
+            },
+            batch_size=len(sorted_output_req_list),
+        )
+
+        return DataProto(batch=batch, non_tensor_batch={"messages": np.array(messages), "reward_scores": np.array(reward_scores)})

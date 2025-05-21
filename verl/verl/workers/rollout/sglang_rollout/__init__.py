@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 
 from .async_sglang_rollout import AsyncSGLangRollout
+from .async_sglang_rollout import MultimodalAsyncSGLangRollout
 from .sglang_rollout import SGLangRollout
 
 __all__ = ["AsyncSGLangRollout", "SGLangRollout"]

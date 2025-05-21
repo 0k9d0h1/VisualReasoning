@@ -1,0 +1,15 @@
+tools:
+  - class_name: "verl.tools.code_execution_tool.CodeExecutionTool"
+    config: {working_dir: "/home/kdh0901/Desktop/Train_VisualReasoning/notebook_working_dir"}
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_executor"
+        description: "A tool for executing the python codes."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "The model's code to be executed, must be a python code"
+          required: ["code"]

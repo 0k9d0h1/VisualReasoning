@@ -76,6 +76,7 @@ def hf_processor(name_or_path, **kwargs):
         processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except Exception:
         processor = None
+
     # Avoid load tokenizer, see:
     # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/auto/processing_auto.py#L344
     if processor is not None and "Processor" not in processor.__class__.__name__:

@@ -56,9 +56,160 @@ from verl.utils.ulysses import (
     ulysses_pad_and_slice_inputs,
 )
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from tensordict.utils import _zip_strict, _LOCK_ERROR
+from tensordict.base import TensorDictBase, CompatibleType, BEST_ATTEMPT_INPLACE, NO_DEFAULT, _is_tensor_collection, T
+from tensordict._nestedkey import NestedKey
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
+
+
+## This is a monkey patch to add the multimodal_split method to the TensorDict class
+def multimodal_split(self, split_size: int | list[int], dim: int = 0, image_pad_token_id=151655, spatial_merge_size=4) -> list[TensorDictBase]:
+    # Dedicated only for visual reasoning
+    # we must use slices to keep the storage of the tensors
+    WRONG_TYPE = "split(): argument 'split_size' must be int or list of ints"
+    batch_size = self.batch_size
+    batch_sizes = []
+    batch_dims = len(batch_size)
+    if dim < 0:
+        dim = len(batch_size) + dim
+    if dim >= batch_dims or dim < 0:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [-{self.batch_dims}, {self.batch_dims - 1}], but got {dim})"
+        )
+    max_size = batch_size[dim]
+    if isinstance(split_size, int):
+        idx0 = 0
+        idx1 = min(max_size, split_size)
+        split_sizes = [slice(idx0, idx1)]
+        batch_sizes.append(
+            torch.Size(
+                tuple(
+                    d if i != dim else idx1 - idx0 for i, d in enumerate(batch_size)
+                )
+            )
+        )
+        while idx1 < max_size:
+            idx0 = idx1
+            idx1 = min(max_size, idx1 + split_size)
+            split_sizes.append(slice(idx0, idx1))
+            batch_sizes.append(
+                torch.Size(
+                    tuple(
+                        d if i != dim else idx1 - idx0
+                        for i, d in enumerate(batch_size)
+                    )
+                )
+            )
+    elif isinstance(split_size, (list, tuple)):
+        if len(split_size) == 0:
+            raise RuntimeError("Insufficient number of elements in split_size.")
+        try:
+            idx0 = 0
+            idx1 = split_size[0]
+            split_sizes = [slice(idx0, idx1)]
+            batch_sizes.append(
+                torch.Size(
+                    tuple(
+                        d if i != dim else idx1 - idx0
+                        for i, d in enumerate(batch_size)
+                    )
+                )
+            )
+            for idx in split_size[1:]:
+                idx0 = idx1
+                idx1 = min(max_size, idx1 + idx)
+                split_sizes.append(slice(idx0, idx1))
+                batch_sizes.append(
+                    torch.Size(
+                        tuple(
+                            d if i != dim else idx1 - idx0
+                            for i, d in enumerate(batch_size)
+                        )
+                    )
+                )
+        except TypeError:
+            raise TypeError(WRONG_TYPE)
+
+        if idx1 < batch_size[dim]:
+            raise RuntimeError(
+                f"Split method expects split_size to sum exactly to {self.batch_size[dim]} (tensor's size at dimension {dim}), but got split_size={split_size}"
+            )
+    else:
+        raise TypeError(WRONG_TYPE)
+    index = (slice(None),) * dim
+    names = self.names if self._has_names() else None
+
+    result = tuple(
+        self._index_tensordict(index + (ss,), new_batch_size=bs, names=names)
+        for ss, bs in _zip_strict(split_sizes, batch_sizes)
+    )
+    
+    pixel_slice_begin = 0
+    grid_slice_begin = 0
+    for r, split_size in zip(result, split_sizes):
+        n_image_pad_tokens = self["input_ids"][split_size, :].eq(image_pad_token_id).sum()
+        pixel_slice_end = pixel_slice_begin + n_image_pad_tokens * spatial_merge_size
+        r["pixel_values"] = self["pixel_values"][pixel_slice_begin:pixel_slice_end, :]
+
+        flat_sizes = torch.tensor([s.prod().item() for s in self["image_grid_thw"][grid_slice_begin:, :]])
+        cumsum = torch.cumsum(flat_sizes, dim=0).to(n_image_pad_tokens.device)
+        match_idx = (cumsum == n_image_pad_tokens * spatial_merge_size).nonzero(as_tuple=True)[0].item()
+        grid_slice_end = grid_slice_begin + match_idx + 1
+        r["image_grid_thw"] = self["image_grid_thw"][grid_slice_begin:grid_slice_end, :]
+        pixel_slice_begin = pixel_slice_end
+        grid_slice_begin = grid_slice_end
+    return result
+
+
+# Monkey patch the TensorDict class
+def _set_str(
+        self,
+        key: NestedKey,
+        value: dict[str, CompatibleType] | CompatibleType,
+        *,
+        inplace: bool,
+        validated: bool,
+        ignore_lock: bool = False,
+        non_blocking: bool = False,
+    ) -> T:
+    if inplace is not False:
+        best_attempt = inplace is BEST_ATTEMPT_INPLACE
+        inplace = self._convert_inplace(inplace, key)
+    if not validated and key != "pixel_values" and key != "image_grid_thw":
+        value = self._validate_value(
+            value, check_shape=True, non_blocking=non_blocking
+        )
+    if not inplace:
+        if self._is_locked and not ignore_lock:
+            raise RuntimeError(_LOCK_ERROR)
+        self._tensordict[key] = value
+    else:
+        try:
+            dest = self._get_str(key, default=NO_DEFAULT)
+            if best_attempt and _is_tensor_collection(type(dest)):
+                dest.update(value, inplace=True, non_blocking=non_blocking)
+            else:
+                if dest is not value:
+                    try:
+                        dest.copy_(value, non_blocking=non_blocking)
+                    except RuntimeError:
+                        # if we're updating a param and the storages match, nothing needs to be done
+                        if not (
+                            isinstance(dest, torch.Tensor)
+                            and dest.data.untyped_storage().data_ptr()
+                            == value.data.untyped_storage().data_ptr()
+                        ):
+                            raise
+        except KeyError as err:
+            raise err
+        except Exception as err:
+            raise ValueError(
+                f"Failed to update '{key}' in tensordict {self}"
+            ) from err
+    return self
 
 
 def extract_step(path):
@@ -235,14 +386,14 @@ class FSDPSFTTrainer:
                     local_model_path,
                     config=config,
                     trust_remote_code=trust_remote_code,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
                 )
             else:
                 self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
                     local_model_path,
                     config=config,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
                     trust_remote_code=trust_remote_code,
                 )
@@ -275,7 +426,7 @@ class FSDPSFTTrainer:
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
-        mixed_precision = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
+        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32)
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
@@ -333,25 +484,25 @@ class FSDPSFTTrainer:
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
-        # Move inputs to GPU and prepare loss mask
-        input_ids = batch["input_ids"].cuda()
-        attention_mask = batch["attention_mask"].cuda()
-        position_ids = batch["position_ids"].cuda()
-        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).cuda()
+        # Move inputs to GPU and prepare loss mask, move to CPU first because some GPU-related bugs
+        input_ids = batch["input_ids"].cpu().cuda()
+        attention_mask = batch["attention_mask"].cpu().cuda()
+        position_ids = batch.pop("position_ids", None)
+        if position_ids:
+            position_ids = position_ids.cpu().cuda()
+        loss_mask = batch.pop("loss_mask")[:, :-1].reshape(-1).cpu().cuda()
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Context manager for sequence parallel if needed
         context = self.sharding_manager if use_sp else nullcontext()
         if self.processor is not None:
-            pixel_values = batch.pop("pixel_values").cuda()
-            image_grid_thw = batch.pop("image_grid_thw").cuda()
+            pixel_values = batch.pop("pixel_values").cpu().cuda()
+            image_grid_thw = batch.pop("image_grid_thw").cpu().cuda()
             with context, torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 if not use_sp:
                     # Standard forward pass without sequence parallel
                     labels = input_ids[:, 1:].contiguous()
-                    print("input loaded")
-                    output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, pixel_values=pixel_values, image_grid_thw=image_grid_thw, use_cache=False)
-                    print("output computed")
+                    output = self.fsdp_model(input_ids=input_ids, attention_mask=attention_mask , pixel_values=pixel_values, image_grid_thw=image_grid_thw, use_cache=False)
                     logits = output.logits
 
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -427,19 +578,19 @@ class FSDPSFTTrainer:
                     loss_mask = loss_mask.to(full_loss.device)
                     loss = full_loss * loss_mask
 
-                valid_token_this_rank = torch.sum(loss_mask)
+        valid_token_this_rank = torch.sum(loss_mask)
 
-                if self.config.data.balance_dp_token:
-                    torch.distributed.all_reduce(valid_token_this_rank)
-                    dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
-                else:
-                    dp_size = 1
+        if self.config.data.balance_dp_token:
+            torch.distributed.all_reduce(valid_token_this_rank)
+            dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
+        else:
+            dp_size = 1
 
-                loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+        loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
 
-                if do_backward:
-                    loss.backward()
-            return loss
+        if do_backward:
+            loss.backward()
+        return loss
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
@@ -457,9 +608,7 @@ class FSDPSFTTrainer:
         n_micro_batches = len(micro_batches)
         step_loss = 0
         for micro_batch in micro_batches:
-            print("Entering to compute loss")
             loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
-            print("Micro batch processed")
             step_loss += loss.item()
 
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
@@ -507,6 +656,8 @@ class FSDPSFTTrainer:
             os.makedirs(path, exist_ok=True)
             self.model.save_pretrained(path, state_dict=state_dict)
             self.tokenizer.save_pretrained(path)
+            if self.processor is not None:
+                self.processor.save_pretrained(path)
             if self.config.trainer.default_hdfs_dir:
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
@@ -587,6 +738,9 @@ class FSDPSFTTrainer:
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
 def main(config):
     local_rank, rank, world_size = initialize_global_process_group()
+
+    TensorDict._set_str = _set_str
+    TensorDict.multimodal_split = multimodal_split
 
     device_mesh = init_device_mesh(device_type="cuda", mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
     dp_size = world_size // config.ulysses_sequence_parallel_size
