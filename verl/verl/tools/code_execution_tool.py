@@ -31,9 +31,35 @@ from .schemas import OpenAIFunctionToolSchema
 from autogen.coding import CodeBlock
 from autogen.coding.jupyter import JupyterCodeExecutor, LocalJupyterServer
 import ast, re
+import torchvision.transforms as T
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+
+# === Step 1: Decode base64 image to PIL ===
+def base64_to_pil(base64_str):
+    img_data = base64.b64decode(base64_str)
+    img = Image.open(BytesIO(img_data)).convert("RGB")
+    return img
+
+# === Step 2: Ensure minimum size ===
+def ensure_min_size(img: Image.Image, min_size=28) -> Image.Image:
+    w, h = img.size
+    if w < min_size or h < min_size:
+        scale = min_size / min(w, h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), resample=Image.BILINEAR)
+    return img
+
+# === Step 3: (Optional) Pad if you want ===
+def pad_to_min_size(img: Image.Image, min_size=28, fill=0) -> Image.Image:
+    w, h = img.size
+    pad_w = max(min_size - w, 0)
+    pad_h = max(min_size - h, 0)
+    padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+    return T.Pad(padding, fill=fill)(img)
 
 
 class CodeExecutionTool(BaseTool):
@@ -186,6 +212,7 @@ class CodeExecutionTool(BaseTool):
                 if line.startswith("<PIL."):
                     if image_idx < len(file_paths):
                         image = Image.open(file_paths[image_idx])
+                        image = ensure_min_size(image, min_size=28)
                         buffered = BytesIO()
                         image.save(buffered, format="PNG")
                         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -200,7 +227,7 @@ class CodeExecutionTool(BaseTool):
                     output_message["content"].append(
                             {
                                 "type": "text",
-                                "text": "data:image/png;base64," + line
+                                "text": line
                             }
                         )
                 new_str += "\n"
@@ -209,6 +236,7 @@ class CodeExecutionTool(BaseTool):
             for file_idx, file in enumerate(file_paths):
                 if file_idx >= image_idx:
                     image = Image.open(file)
+                    image = ensure_min_size(image, min_size=28)
                     buffered = BytesIO()
                     image.save(buffered, format="PNG")
                     image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -218,11 +246,12 @@ class CodeExecutionTool(BaseTool):
                             "image": "data:image/png;base64," + image_base64
                         }
                     )
+                    os.remove(file)
             
             output_message["content"].append(
                 {
                     "type": "text",
-                    "text": "</tool_response>\n"
+                    "text": "\n</tool_response>\n"
                 }
             )
                 

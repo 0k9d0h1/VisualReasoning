@@ -544,7 +544,7 @@ class AsyncSGLangRollout(BaseRollout):
 
         tool_reward_tasks = []
         for name in _req.tools_kwargs.keys():
-            tool = self._tool_map[name]
+            tool = _req.executor_tool
             tool_reward_tasks.append(calc_reward_and_release_fn(name, tool))
         tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
         tool_reward_scores = dict(tool_reward_scores)
@@ -749,6 +749,8 @@ class MultimodalAsyncSGLangRollout(AsyncSGLangRollout):
         super().__init__(actor_module, config, tokenizer, model_hf_config, port=port, **kwargs)
         self.processor = processor
         self.executor_tools = {}
+        self.pixel_values = {}
+        self.image_grid_thw = {}
 
     def _apply_tool_chat_template(self, prompt_with_chat_template, _tool_schemas,):
         tool_chat_template = f"""\n\n# Tools
@@ -829,10 +831,11 @@ For each function call, return a json object with function name and arguments wi
                             for tool_call in parsed_tool_calls
                         ]
                     )
-                    print(f"tool_call_results: {tool_call_results}")
-                    print("-" * 200)
+
                     for tool_call, (resp, reward, metrics) in zip(parsed_tool_calls, tool_call_results):
-                        _req.add_tool_response_message(self.processor, resp, format=self.config.multi_turn.format)
+                        _pixel_values, _image_grid_thw = _req.add_tool_response_message(self.processor, resp, format=self.config.multi_turn.format)
+                        self.pixel_values[_req.request_id] = _pixel_values
+                        self.image_grid_thw[_req.request_id] = _image_grid_thw
                         if len(_req.input_ids) >= self.config.max_model_len:
                             break
                     if len(_req.input_ids) >= self.config.max_model_len:
@@ -872,14 +875,14 @@ For each function call, return a json object with function name and arguments wi
                 # users can customize different sampling_params at different run
                 with self.update_sampling_params(**kwargs):
                     output = await self._engine.async_generate(
-                        prompt=generation_prompt,
-                        image_data=image_inputs,
+                        prompt=[generation_prompt],
+                        image_data=[image_inputs],
                         sampling_params=self.sampling_params,
                         return_logprob=False,
                     )
-                content = output["text"]
+                content = output[0]["text"]
 
-                finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
+                finish_reason_type = FinishReasonTypeEnum.from_str(output[0]["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
                 if finish_reason_type == FinishReasonTypeEnum.LENGTH:
                     _req.add_assistant_message(self.tokenizer, content, already_over_long=True, format=self.config.multi_turn.format)
@@ -932,9 +935,16 @@ For each function call, return a json object with function name and arguments wi
 
         tool_reward_tasks = []
         for name in _req.tools_kwargs.keys():
-            tool = self._tool_map[name]
+            tool = self.executor_tools[_req.request_id]
             tool_reward_tasks.append(calc_reward_and_release_fn(name, tool))
-        tool_reward_scores = await asyncio.gather(*tool_reward_tasks)
+        try:
+            tool_reward_scores = await asyncio.gather(
+                *tool_reward_tasks, return_exceptions=True
+            )
+        except Exception as e:
+            # gather itself crashed before we got a chance to inspect
+            print("Gather raised:", repr(e))
+            raise
         tool_reward_scores = dict(tool_reward_scores)
         _req.finalize(self.tokenizer, tool_reward_scores, finish_reason_type)
 
@@ -1006,6 +1016,8 @@ For each function call, return a json object with function name and arguments wi
                     _attention_mask = _attention_mask.tolist()
                     _image_grid_thw = inputs.get("image_grid_thw")
                     _pixel_values = inputs.get("pixel_values")
+                    self.pixel_values[request_id] = _pixel_values
+                    self.image_grid_thw[request_id] = _image_grid_thw
 
                     if len(_input_ids) > self.config.prompt_length:
                         logger.warning(
@@ -1035,8 +1047,6 @@ For each function call, return a json object with function name and arguments wi
                     input_ids=_input_ids,
                     prompt_ids=_input_ids,
                     response_ids=[],
-                    image_grid_thw=_image_grid_thw,
-                    pixel_values=_pixel_values,
                     attention_mask=_attention_mask,
                     prompt_attention_mask=_attention_mask,
                     response_attention_mask=[],
@@ -1078,18 +1088,19 @@ For each function call, return a json object with function name and arguments wi
         else:
             sorted_output_req_list = None
 
-        [sorted_output_req_list] = broadcast_pyobj(
+        received = broadcast_pyobj(
             data=[sorted_output_req_list],
             rank=self._tp_rank,
             dist_group=self._device_mesh_cpu["tp"].get_group(),
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+
         # Construct the batch data
         prompt_ids, response_ids = [], []
         prompt_attention_mask, response_attention_mask = [], []
-        prompt_position_ids, response_position_ids = [], []
         prompt_loss_mask, response_loss_mask = [], []
+        multi_modal_inputs = []
         messages = []
         reward_scores = []
         for req in sorted_output_req_list:
@@ -1117,10 +1128,12 @@ For each function call, return a json object with function name and arguments wi
                 )
             prompt_attention_mask.append(torch.tensor(req.prompt_attention_mask, dtype=torch.int, device=tgt_device))
             response_attention_mask.append(torch.tensor(req.response_attention_mask, dtype=torch.int, device=tgt_device))
-            prompt_position_ids.append(torch.tensor(req.prompt_position_ids, dtype=torch.int, device=tgt_device))
-            response_position_ids.append(torch.tensor(req.response_position_ids, dtype=torch.int, device=tgt_device))
             prompt_loss_mask.append(torch.tensor(req.prompt_loss_mask, dtype=torch.int, device=tgt_device))
             response_loss_mask.append(torch.tensor(req.response_loss_mask, dtype=torch.int, device=tgt_device))
+            multi_modal_inputs.append({
+                "pixel_values": self.pixel_values[req.request_id].to(torch.int64),
+                "image_grid_thw": self.image_grid_thw[req.request_id].to(torch.int64),
+            })
             messages.append({"messages": req.messages})
             reward_scores.append(req.reward_scores)
 
@@ -1136,12 +1149,6 @@ For each function call, return a json object with function name and arguments wi
         response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
         if response_attention_mask.shape[1] < self.config.response_length:
             response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
-        prompt_position_ids = pad_sequence(prompt_position_ids, batch_first=True, padding_value=0, padding_side="left")
-        if prompt_position_ids.shape[1] < self.config.prompt_length:
-            prompt_position_ids = pad_sequence_to_length(prompt_position_ids, self.config.prompt_length, 0, left_pad=True)
-        response_position_ids = pad_sequence(response_position_ids, batch_first=True, padding_value=0)
-        if response_position_ids.shape[1] < self.config.response_length:
-            response_position_ids = pad_sequence_to_length(response_position_ids, self.config.response_length, 0)
         prompt_loss_mask = pad_sequence(prompt_loss_mask, batch_first=True, padding_value=0, padding_side="left")
         if prompt_loss_mask.shape[1] < self.config.prompt_length:
             prompt_loss_mask = pad_sequence_to_length(prompt_loss_mask, self.config.prompt_length, 0, left_pad=True)
@@ -1151,20 +1158,18 @@ For each function call, return a json object with function name and arguments wi
 
         input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
         attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
-        position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)
         loss_mask = torch.cat((prompt_loss_mask, response_loss_mask), dim=-1)
 
         # Construct the batch data
         batch = TensorDict(
             {
-                "prompts": prompt_ids,
-                "responses": response_ids,
-                "input_ids": input_ids,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "loss_mask": loss_mask,
+                "prompts": prompt_ids.to(torch.int64),
+                "responses": response_ids.to(torch.int64),
+                "input_ids": input_ids.to(torch.int64),  # here input_ids become the whole sentences
+                "attention_mask": attention_mask.to(torch.int64),
+                "loss_mask": loss_mask.to(torch.int64),
             },
             batch_size=len(sorted_output_req_list),
         )
 
-        return DataProto(batch=batch, non_tensor_batch={"messages": np.array(messages), "reward_scores": np.array(reward_scores)})
+        return DataProto(batch=batch, non_tensor_batch={"messages": np.array(messages), "reward_scores": np.array(reward_scores), "multi_modal_inputs": np.array(multi_modal_inputs),})

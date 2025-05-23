@@ -21,6 +21,8 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import yaml
+import shutil
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -877,6 +879,9 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        is_multimodal = True
+        is_tool_using = True
+
         self.global_steps = 0
 
         # load checkpoint before doing anything
@@ -909,10 +914,12 @@ class RayPPOTrainer:
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_inputs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+                    is_multimodal = True
                 if "raw_prompt" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                    is_tool_using = True
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -950,6 +957,21 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    if is_tool_using and is_multimodal:
+                        batch.batch["position_ids"] = [None] * len(batch.batch["responses"])
+                        yaml_path = self.config.actor_rollout_ref.rollout.multi_turn.tool_config_path
+                        with open(yaml_path, "r") as f:
+                            data = yaml.safe_load(f)
+                        working_dirs = []
+                        for tool in data.get('tools', []):
+                            cfg = tool.get('config', {})
+                            if 'working_dir' in cfg:
+                                working_dirs.append(cfg['working_dir'])
+
+                        for wdir in working_dirs:
+                            if os.path.exists(wdir) and os.path.isdir(wdir):
+                                shutil.rmtree(wdir)   # Deletes entire directory tree!
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.

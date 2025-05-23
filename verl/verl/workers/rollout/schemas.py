@@ -234,8 +234,6 @@ class MultimodalAsyncRolloutRequest(BaseModel):
     prompt_ids: List[int]
     response_ids: List[int]
     position_ids: List[int] = None
-    image_grid_thw: torch.Tensor
-    pixel_values: torch.Tensor
     attention_mask: List[int]
     prompt_attention_mask: List[int]
     response_attention_mask: List[int]
@@ -257,7 +255,7 @@ class MultimodalAsyncRolloutRequest(BaseModel):
             "assistant_prefix_msg": "\n<|im_start|>assistant\n",
             "assistant_suffix_msg": "<|im_end|>",
             "tool_prefix_msg": "\n<|im_start|>user\n<tool_response>\n",
-            "tool_suffix_msg": "</tool_response>\n<|im_end|>",
+            "tool_suffix_msg": "</tool_response>\n<|im_end|>\n",
         },
     }
 
@@ -361,9 +359,6 @@ For each function call, return a json object with function name and arguments wi
             # if tool_calls is not None:
             #     content += self.format_config[format]["tool_prefix_msg"]
             content_token_ids = tokenizer.encode(content, add_special_tokens=False)
-            print(f"content: {content}")
-            print(f"decoded self.input_ids: {tokenizer.decode(self.input_ids)}")
-            print(f"decoded content_token_ids: {tokenizer.decode(content_token_ids)}")
             if self.input_ids[-len(prefix_token_ids) :] == prefix_token_ids:
                 append_token_ids = content_token_ids
                 _loss_mask = [1] * len(content_token_ids)
@@ -391,21 +386,45 @@ For each function call, return a json object with function name and arguments wi
 
     def add_tool_response_message(self, processor, content, format: Literal["chatml"] = "chatml") -> None:
         """Currently, we only support chatml format."""
+        
+        def _remove_enclosed_span(arr, prefix, suffix):
+            arr = arr.tolist()  # For easy slicing/searching
+            prefix = prefix
+            suffix = suffix
+            
+            # Find start of prefix
+            for start in range(len(arr) - len(prefix) + 1):
+                if arr[start:start+len(prefix)] == prefix:
+                    break
+            else:
+                # Prefix not found
+                print("Prefix not found")
+                return torch.tensor(arr)
+            
+            # Find start of suffix (after prefix)
+            for end in range(start + len(prefix), len(arr) - len(suffix) + 1):
+                if arr[end:end+len(suffix)] == suffix:
+                    break
+            else:
+                # Suffix not found
+                print("Suffix not found")
+                return torch.tensor(arr)
+            
+            # Remove span from start to end+len(suffix)
+            result = arr[:start] + arr[end+len(suffix):]
+            return result
+
         self.messages.append(content[1])
-        print(f"self.messages after appending tool response: {self.messages}")
         # TODO: support other formats
         if format in self.format_config:
             text = processor.apply_chat_template(self.messages, add_generation_prompt=False, tokenize=False)
             image_inputs, _ = process_vision_info(self.messages)
             inputs = processor(text=[text], images=image_inputs, return_tensors="pt")
 
-            append_token_ids = processor.apply_chat_template([self.messages[-1]], add_generation_prompt=False, return_tensors="pt", tokenize=True)[0]
-
-            print("decoded append token ids: ", processor.tokenizer.decode(append_token_ids))
-            print("=" * 200)
-
-            self.image_grid_thw = inputs["image_grid_thw"]
-            self.pixel_values = inputs["pixel_values"]
+            append_token_ids = processor.apply_chat_template([self.messages[-1]], add_generation_prompt=True, tokenize=True, return_tensors="pt")[0]
+            system_prefix_token_ids = processor.tokenizer.encode("<|im_start|>system", add_special_tokens=False)
+            system_suffix_token_ids = processor.tokenizer.encode("<|im_end|>\n", add_special_tokens=False)
+            append_token_ids = _remove_enclosed_span(append_token_ids, system_prefix_token_ids, system_suffix_token_ids)
 
             self.input_ids += append_token_ids
             _attention_mask = [1] * len(append_token_ids)
@@ -415,6 +434,8 @@ For each function call, return a json object with function name and arguments wi
             raise ValueError(f"Unsupported format: {format}")
         assert len(self.input_ids) == len(self.attention_mask) == len(self.loss_mask), f"""Request {self.request_id} has different length of {len(self.input_ids)=}, 
             {len(self.attention_mask)=}, {len(self.loss_mask)=}"""
+        
+        return inputs["pixel_values"], inputs["image_grid_thw"]
 
     def finalize(
         self,
